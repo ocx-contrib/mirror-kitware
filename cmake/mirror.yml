@@ -1,0 +1,283 @@
+extends: ../mirror-base.yml
+
+name: cmake
+
+# Logical index package `kitware/cmake` lives at the physical path
+# `ghcr.io/ocx-contrib/kitware/cmake` — slash segments, never hyphen-flattened.
+# The first segment must be this repo's own owner or `GITHUB_TOKEN` cannot
+# create the package. Linkage to this repo comes from the
+# `org.opencontainers.image.source` annotation the pipeline writes.
+target:
+  registry: ghcr.io
+  repository: ocx-contrib/kitware/cmake
+
+source:
+  type: github_release
+  owner: Kitware
+  repo: CMake
+  # Upstream tags are `vX.Y.Z`, and release candidates `vX.Y.Z-rcN`; the asset
+  # filenames drop the leading `v`. Observed 2026-07-29:
+  #
+  #   $ gh api "repos/Kitware/CMake/releases?per_page=30" \
+  #       --jq '.[] | "\(.tag_name)\t prerelease=\(.prerelease)"'
+  #   v4.4.1        prerelease=false
+  #   v4.4.0        prerelease=false
+  #   v4.4.0-rc3    prerelease=true
+  #   v4.3.4        prerelease=false
+  #   …
+  #
+  # The `(?:-rc\d+)?` group is deliberate. A pattern that structurally cannot
+  # match `-rcN` conflates upstream's tag GRAMMAR with this mirror's release
+  # POLICY, and then `skip_prereleases` is decorative — flipping it changes
+  # nothing. Here the pattern describes what Kitware tags and
+  # `skip_prereleases: true` (mirror-base.yml) is the single knob that decides
+  # what ships. Residual: the filter reads GitHub's own `prerelease` flag
+  # (`src/source/github_release.rs`: `is_prerelease: release.prerelease`), not
+  # the semver prerelease segment, so an rc published WITHOUT that flag would
+  # be admitted and, being the highest version, would take the `latest`
+  # cascade tag. Every rc in the survey above carries the flag.
+  tag_pattern: "^v(?P<version>\\d+\\.\\d+\\.\\d+(?:-rc\\d+)?)$"
+
+# ─── libc gate (Phase 3.5) — the evidence, not the conclusion ───────────────
+#
+# Measured on the real 4.4.1 assets, both arches, every shipped executable:
+#
+#   $ file cmake-4.4.1-linux-x86_64/bin/cmake
+#   ELF 64-bit LSB executable, x86-64, version 1 (GNU/Linux), dynamically
+#   linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 2.6.32,
+#   BuildID[sha1]=893b6530…, stripped
+#
+#   $ file cmake-4.4.1-linux-aarch64/bin/cmake
+#   ELF 64-bit LSB executable, ARM aarch64, version 1 (GNU/Linux), dynamically
+#   linked, interpreter /lib/ld-linux-aarch64.so.1, for GNU/Linux 3.7.0,
+#   BuildID[sha1]=8261da43…, stripped
+#
+# Dynamically linked against the glibc loader on BOTH arches — neither is
+# static, so neither covers a musl userland. The glibc floor is NOT symmetric
+# and was measured per arch rather than inferred from the x86_64 result:
+#
+#   $ for b in cmake ctest cpack ccmake cmake-gui; do
+#       readelf -V <arch>/bin/$b | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+#     done
+#   x86_64  → GLIBC_2.17 for all five   (full set tops out at 2.17)
+#   aarch64 → GLIBC_2.28 for all five   (full set: 2.17, 2.25, 2.28)
+#
+#   $ readelf -d cmake-4.4.1-linux-aarch64/bin/cmake | grep NEEDED
+#   libdl.so.2  librt.so.1  libpthread.so.0  libm.so.6  libc.so.6
+#   ld-linux-aarch64.so.1
+#
+# Nothing beyond libc in the closure for cmake/ctest/cpack/ccmake — ccmake
+# links its curses UI statically. Both container images below carry glibc 2.39,
+# clearing the 2.28 arm64 floor with room.
+#
+# Upstream publishes NO musl build: the only Linux assets on every release
+# checked are `cmake-<V>-linux-{x86_64,aarch64}.{tar.gz,sh}` (the `.sh` being a
+# self-extracting installer of the same glibc binaries). So the Linux keys
+# carry `+libc.glibc` and the alpine leg is dropped — one decision, taken
+# together. Without the suffix the package would publish an EMPTY
+# `os.features`, which is a positive claim that it loads under any Linux
+# userland; an Alpine consumer would then resolve a binary whose ELF
+# interpreter does not exist on their system and get a bare "No such file or
+# directory" for a file that is plainly there.
+#
+# ─── Asset scope (Phase 2, both directions) ────────────────────────────────
+#
+# Every regex below was checked to match EXACTLY ONE asset at v3.31.0 (the
+# floor), v3.31.12, v4.0.0 and v4.4.1 (newest) — 0 matches is a SILENT skip,
+# so the check has to run forward, and the inverse pass enumerated every
+# remaining asset to confirm each is deliberately out of scope:
+#
+#   cmake-<V>-linux-{x86_64,aarch64}.sh       self-extracting installer, not an archive
+#   cmake-<V>-macos-universal.dmg             disk image, not an archive
+#   cmake-<V>-macos10.10-universal.tar.gz     legacy deployment-target build; the
+#                                             anchored `-macos-universal\.tar\.gz$`
+#                                             cannot match `-macos10.10-universal…`
+#   cmake-<V>-windows-{x86_64,arm64,i386}.msi installer, not an archive
+#   cmake-<V>-windows-i386.zip                32-bit; no OCX platform key
+#   cmake-<V>-sunos-{x86_64,sparc64}.*        no GHA runner, no OCX platform key
+#   cmake-<V>.{tar.gz,zip}                    source distribution
+#   cmake-<V>-SHA-256.txt(.asc)               digest sidecars — `verify.github_asset_digest`
+#                                             reads GitHub's own asset digest instead
+#
+# ONE macOS asset serves BOTH darwin platforms. It is a genuine fat binary, not
+# an x86_64 build we hope Rosetta covers:
+#
+#   $ file cmake-4.4.1-macos-universal/CMake.app/Contents/bin/cmake
+#   Mach-O universal binary with 2 architectures:
+#     [x86_64: Mach-O 64-bit x86_64 executable, …PIE…] [arm64]
+#
+#   $ file .../windows-x86_64/bin/cmake.exe  → PE32+ … x86-64
+#   $ file .../windows-arm64/bin/cmake.exe   → PE32+ … ARM64
+assets:
+  # Quote nothing here: no key contains `+` … except the two that do.
+  "linux/amd64+libc.glibc":
+    - "^cmake-.*-linux-x86_64\\.tar\\.gz$"
+  "linux/arm64+libc.glibc":
+    - "^cmake-.*-linux-aarch64\\.tar\\.gz$"
+  darwin/amd64:
+    - "^cmake-.*-macos-universal\\.tar\\.gz$"
+  darwin/arm64:
+    - "^cmake-.*-macos-universal\\.tar\\.gz$"
+  windows/amd64:
+    - "^cmake-.*-windows-x86_64\\.zip$"
+  windows/arm64:
+    - "^cmake-.*-windows-arm64\\.zip$"
+
+asset_type:
+  # Every one of the five archives wraps its content in a single
+  # `cmake-<V>-<target>/` directory, on every version checked from 3.31.0 to
+  # 4.4.1 — uniform, so one global rule rather than per-platform overrides.
+  type: archive
+  strip_components: 1
+
+# The point of this mirror. `verify`, not `auto`: the binary set here is
+# PLATFORM-ASYMMETRIC — `ccmake` ships on Linux and macOS but not Windows,
+# `cmcldeps` only on Windows — so the interesting property is precisely that
+# each platform's list is what it claims to be. A declared-and-verified list
+# turns upstream rearranging its archive into a red run instead of a silent
+# metadata drift; `auto` would absorb the change and publish it.
+#
+# Safe to hand-list because the set was checked at BOTH ends of the range, not
+# just the newest release — `verify` fails the run on any executable the list
+# omits, so a set that drifted mid-range would red every backfill:
+#
+#   v3.31.0  linux x86_64 / aarch64 / macos  bin/ → ccmake cmake cmake-gui cpack ctest
+#   v3.31.0  windows x86_64 / arm64          bin/ → cmake.exe cmake-gui.exe
+#                                                   cmcldeps.exe cpack.exe ctest.exe
+#   v4.4.1   … identical on all five targets
+#
+# `verify` is one-directional in the direction that matters: an executable on
+# the interface surface that the metadata does not list fails the run, and a
+# listed name present but not executable fails too, while a listed name simply
+# absent from disk is legal. That last case is why the Windows list is its own
+# file rather than the Linux list minus nothing — declaring `ccmake` on Windows
+# would pass verify while publishing a command that is not there.
+bin_scan: verify
+
+metadata:
+  # Paths resolve against THIS spec's directory, not the repo root.
+  #
+  # Three layouts, so three files:
+  #   linux   →  bin/                          (metadata.json)
+  #   darwin  →  CMake.app/Contents/bin/       (metadata-darwin.json)
+  #   windows →  bin/, no ccmake, + cmcldeps   (metadata-windows.json)
+  #
+  # The darwin `.app` is the real special case: the archive unpacks to
+  # `CMake.app/Contents/{bin,man,doc,share}`, and `Contents/bin/cmake-gui` is a
+  # symlink to `../MacOS/CMake` which resolves once the whole archive is
+  # extracted (`ls -la` shows `cmake-gui -> ../MacOS/CMake`; the scan follows
+  # symlinks and claims the link's own name).
+  #
+  # Every file this block can select is checked by the `bin_scan` load gate,
+  # and all three point PATH at a SUBDIRECTORY of `${installPath}` — a bare
+  # `${installPath}` would give the scan nowhere to look and is rejected at
+  # spec load with exit 65.
+  #
+  # The claim each file makes, computed by replaying ocx's scan rules
+  # (`ocx_lib/src/package/bin_scan.rs`: immediate entries only, `is_file()`,
+  # Unix exec bit / Windows `.exe .com .bat .cmd` stem) over the real 4.4.1
+  # trees rather than read off the upstream README:
+  #
+  #   linux/{amd64,arm64}  bin/  → ccmake cmake cmake-gui cpack ctest
+  #   darwin/*  CMake.app/Contents/bin/ → ccmake cmake cmake-gui cpack ctest
+  #   windows/{amd64,arm64} bin/ → cmake cmake-gui cmcldeps cpack ctest
+  #
+  # No MANPATH var, and that is a measurement rather than an omission. It would
+  # add a SECOND scan target per platform, and upstream's `man/` is not uniform:
+  #
+  #   $ tar tzf cmake-4.4.1-linux-aarch64.tar.gz | grep -c '/man/'   → 0
+  #   $ tar tzf cmake-4.4.1-linux-x86_64.tar.gz  | grep -c '/man/'   → 31
+  #   $ tar tzf cmake-3.31.0-linux-aarch64.tar.gz | grep '/man/'     → present
+  #
+  # So 4.4.1 dropped `man/` from the aarch64 tarball while keeping it on
+  # x86_64, and 3.31.0 had it on both. One shared linux metadata.json cannot
+  # declare `${installPath}/man` truthfully for both arches, and splitting the
+  # file by arch to ship man pages is not worth a fourth metadata file. (Had it
+  # been declared, it would still have contributed nothing to `binaries`:
+  # `man/` holds only the `man1/` and `man7/` directories, and the scan filters
+  # to `is_file()` — verified on all five 4.4.1 trees.)
+  default: metadata.json
+  platforms:
+    darwin/amd64: metadata-darwin.json
+    darwin/arm64: metadata-darwin.json
+    windows/amd64: metadata-windows.json
+    windows/arm64: metadata-windows.json
+
+catalog:
+  # Resolves against this spec's own directory, so the repo-root logo shared by
+  # every future Kitware spec has to be named explicitly. CATALOG.md is found
+  # by the default probe beside this file.
+  logo: ../logo.svg
+
+versions:
+  # Matches the coverage of the legacy flat mirror this repo supersedes. From
+  # 3.31.0 up, asset naming is uniform (the lowercase `linux-x86_64` /
+  # `windows-x86_64` forms landed in 3.20.0 and `macos-universal` in 3.19.2),
+  # so one anchored pattern per platform covers the whole range with no
+  # version-keyed alternatives, and `windows/arm64` exists for every version in
+  # it. A lower floor would need multi-pattern `assets:` and would reopen the
+  # binary-set check that `bin_scan: verify` now enforces.
+  min: "3.31.0"
+  new_per_run: 5
+  # Staggered off the hour against the rest of the fleet so the mirrors don't
+  # hit the GitHub releases API in the same minute.
+  poll_interval: "40 */6 * * *"
+
+tests:
+  # `script:` paths resolve from the REPOSITORY ROOT, not from this spec's
+  # directory — the opposite of `metadata.default` and `catalog.*` above.
+  - name: smoke
+    script: cmake/tests/smoke.star
+
+platforms:
+  # Container legs, not native ones: each image runs the same bundle under its
+  # own loader, and `(version, platform)` is green only when every leg is,
+  # which is what gates the push.
+  #
+  # Two glibc images and NO alpine — the deliberate other half of the
+  # `+libc.glibc` decision recorded above `assets:`. An alpine leg here would
+  # assert something this package has never promised and would red every run
+  # with `ENOENT` on a path that plainly exists (the loader reporting the
+  # missing interpreter). ubuntu and fedora still cover two distinct
+  # distributions, loaders and library sets.
+  "linux/amd64+libc.glibc":
+    runner: ubuntu-latest
+    containers:
+      - { image: "ubuntu:24.04", shell: bash }
+      - { image: "fedora:40",    shell: bash }
+  "linux/arm64+libc.glibc":
+    # arm64 container legs run natively — no qemu — so the runner arch must
+    # match the platform or the renderer's guard reds the leg up front.
+    runner: ubuntu-24.04-arm
+    containers:
+      - { image: "ubuntu:24.04", shell: bash }
+      - { image: "fedora:40",    shell: bash }
+  darwin/amd64:
+    # Intel slice tested on the arm64 macos-14 runner via Rosetta 2 — the
+    # x86_64 slice of the fat binary is a native Mach-O, which Rosetta
+    # translates fine. Never native `macos-13`: GitHub's Intel pool is
+    # exhausted, a queued leg never schedules, and `push` (needs: test) then
+    # deadlocks the whole mirror.
+    runner: macos-14
+  darwin/arm64:
+    runner: macos-14
+  windows/amd64:
+    runner: windows-latest
+    shell: pwsh
+  windows/arm64:
+    # Native arm64 Windows runner — the amd64 pool cannot execute an ARM64 PE,
+    # and there is no Rosetta equivalent to lean on.
+    runner: windows-11-arm
+    shell: pwsh
+
+annotations:
+  # From the Phase 1.5 license gate:
+  #   $ gh api repos/Kitware/CMake/license --jq '.license.spdx_id'
+  #   BSD-3-Clause
+  org.opencontainers.image.licenses: "BSD-3-Clause"
+
+announce:
+  # Spelled out, not derived from target.repository — the logical name and the
+  # physical path are related by convention only.
+  package: kitware/cmake
+  fork: ocx-contrib/index
