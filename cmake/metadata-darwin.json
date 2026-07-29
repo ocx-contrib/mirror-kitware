@@ -1,0 +1,14 @@
+{
+  "type": "bundle",
+  "version": 1,
+  "binaries": ["ccmake", "cmake", "cmake-gui", "cpack", "ctest"],
+  "env": [
+    {
+      "key": "PATH",
+      "type": "path",
+      "required": true,
+      "value": "${installPath}/CMake.app/Contents/bin",
+      "visibility": "public"
+    }
+  ]
+}
