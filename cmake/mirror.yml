@@ -221,7 +221,7 @@ versions:
   new_per_run: 5
   # Staggered off the hour against the rest of the fleet so the mirrors don't
   # hit the GitHub releases API in the same minute.
-  poll_interval: "40 */6 * * *"
+  poll_interval: "51 4-23/6 * * *"
 
 tests:
   # `script:` paths resolve from the REPOSITORY ROOT, not from this spec's
